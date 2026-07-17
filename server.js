@@ -937,6 +937,7 @@ class YahooMailMCPServer {
 
                 const emails = [];
                 const foundUIDs = new Set();
+                const parsePromises = [];
 
                 fetch.on('message', (msg, seqno) => {
                     let buffer = '';
@@ -954,25 +955,31 @@ class YahooMailMCPServer {
                     });
 
                     msg.once('end', () => {
-                        simpleParser(buffer, (err, parsed) => {
-                            if (err) {
+                        // Use the Promise-based form of simpleParser (instead of the
+                        // callback form) so we can await parsing completion below.
+                        // Previously, fetch.once('end') could fire and resolve the
+                        // outer Promise before these async parse callbacks finished,
+                        // causing empty/incomplete results (see GitHub issue #14).
+                        const parsePromise = simpleParser(buffer)
+                            .then((parsed) => {
+                                emails.push({
+                                    uid: attrs.uid,
+                                    sequenceNumber: seqno,  // Still include for reference
+                                    from: parsed.from?.text || 'Unknown',
+                                    to: parsed.to?.text || 'Unknown',
+                                    subject: parsed.subject || 'No Subject',
+                                    date: parsed.date || 'Unknown Date',
+                                    size: attrs.size || 0,
+                                    flags: attrs.flags || [],
+                                    hasAttachments: this.hasAttachments(attrs.struct),
+                                    content: parsed.text || parsed.html || 'No content available'
+                                });
+                            })
+                            .catch((err) => {
                                 console.error('Error parsing email:', err);
-                                return;
-                            }
-
-                            emails.push({
-                                uid: attrs.uid,
-                                sequenceNumber: seqno,  // Still include for reference
-                                from: parsed.from?.text || 'Unknown',
-                                to: parsed.to?.text || 'Unknown',
-                                subject: parsed.subject || 'No Subject',
-                                date: parsed.date || 'Unknown Date',
-                                size: attrs.size || 0,
-                                flags: attrs.flags || [],
-                                hasAttachments: this.hasAttachments(attrs.struct),
-                                content: parsed.text || parsed.html || 'No content available'
                             });
-                        });
+
+                        parsePromises.push(parsePromise);
                     });
                 });
 
@@ -981,7 +988,12 @@ class YahooMailMCPServer {
                     reject(err);
                 });
 
-                fetch.once('end', () => {
+                fetch.once('end', async () => {
+                    // Wait for every message's async parse to finish before
+                    // inspecting `emails` — fixes the race condition described
+                    // in GitHub issue #14.
+                    await Promise.all(parsePromises);
+
                     imap.end();
 
                     // Check for missing UIDs
