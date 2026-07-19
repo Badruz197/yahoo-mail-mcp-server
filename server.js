@@ -303,6 +303,32 @@ class YahooMailMCPServer {
                             type: 'object',
                             properties: {}
                         }
+                    },
+                    {
+                        name: 'save_attachments',
+                        description: 'Extract attachments from one or more emails (by UID) and return their contents as base64-encoded resources, so they can be decoded and read (e.g. PDF, XLSX, DOCX). Use list_emails or search_emails first to find UIDs with hasAttachments: true. Attachments over 25MB are skipped with a note instead of being returned.',
+                        inputSchema: {
+                            type: 'object',
+                            properties: {
+                                uids: {
+                                    type: 'array',
+                                    items: { type: 'number' },
+                                    description: 'Array of UIDs of emails whose attachments should be extracted.',
+                                    minItems: 1
+                                },
+                                folder: {
+                                    type: 'string',
+                                    description: 'Folder containing the emails (default: INBOX)',
+                                    default: 'INBOX'
+                                },
+                                filenameContains: {
+                                    type: 'string',
+                                    description: 'Optional case-insensitive filter — only return attachments whose filename contains this substring.',
+                                    default: null
+                                }
+                            },
+                            required: ['uids']
+                        }
                     }
                 ]
             };
@@ -353,6 +379,9 @@ class YahooMailMCPServer {
 
                     case 'list_folders':
                         return await this.listFolders();
+
+                    case 'save_attachments':
+                        return await this.saveAttachments(args.uids, args?.folder || 'INBOX', args?.filenameContains || null);
 
                     default:
                         throw new Error(`Unknown tool: ${name}`);
@@ -1030,6 +1059,178 @@ class YahooMailMCPServer {
                             text: emailContent
                         }]
                     });
+                });
+            });
+        });
+    }
+
+    /**
+     * Extract attachments from one or more emails (by UID) and return their
+     * raw bytes as base64-encoded MCP resource blocks. Modeled on readEmails()
+     * — same fetch/parse/await-all-promises pattern — but pulls parsed.attachments
+     * from mailparser instead of the text/html body.
+     *
+     * Attachments are returned inline (base64) rather than written to a path
+     * on this server's own disk, since that disk isn't reachable by the MCP
+     * client — returning the bytes directly is what lets the caller actually
+     * decode and read the file.
+     */
+    async saveAttachments(uids, folder = 'INBOX', filenameContains = null) {
+        const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024; // 25MB cap to keep responses reasonable
+
+        const validationError = this.validateUIDs(uids);
+        if (validationError) {
+            return {
+                content: [{
+                    type: 'text',
+                    text: `Error: ${validationError}`
+                }]
+            };
+        }
+
+        const imap = await this.createImapConnection();
+
+        return new Promise((resolve, reject) => {
+            imap.openBox(folder, true, (err, box) => {  // true = read-only mode
+                if (err) {
+                    imap.end();
+                    reject(new Error(`Failed to open folder "${folder}": ${err.message}`));
+                    return;
+                }
+
+                const source = uids.join(',');
+
+                const fetch = imap.fetch(source, {
+                    bodies: '',
+                    struct: true
+                });
+
+                const results = [];
+                const foundUIDs = new Set();
+                const parsePromises = [];
+
+                fetch.on('message', (msg, seqno) => {
+                    let buffer = '';
+                    let attrs = null;
+
+                    msg.on('body', (stream) => {
+                        stream.on('data', (chunk) => {
+                            buffer += chunk.toString('ascii');
+                        });
+                    });
+
+                    msg.once('attributes', (attributes) => {
+                        attrs = attributes;
+                        foundUIDs.add(attributes.uid);
+                    });
+
+                    msg.once('end', () => {
+                        const parsePromise = simpleParser(buffer)
+                            .then((parsed) => {
+                                let attachments = parsed.attachments || [];
+
+                                if (filenameContains) {
+                                    const needle = filenameContains.toLowerCase();
+                                    attachments = attachments.filter((att) =>
+                                        (att.filename || '').toLowerCase().includes(needle)
+                                    );
+                                }
+
+                                results.push({
+                                    uid: attrs.uid,
+                                    subject: parsed.subject || 'No Subject',
+                                    attachments: attachments.map((att) => ({
+                                        filename: att.filename || `attachment-${attrs.uid}-${att.checksum || Date.now()}`,
+                                        contentType: att.contentType || 'application/octet-stream',
+                                        size: att.size || (att.content ? att.content.length : 0),
+                                        content: att.content || Buffer.alloc(0)
+                                    }))
+                                });
+                            })
+                            .catch((err) => {
+                                console.error('Error parsing email for attachments:', err);
+                            });
+
+                        parsePromises.push(parsePromise);
+                    });
+                });
+
+                fetch.once('error', (err) => {
+                    imap.end();
+                    reject(err);
+                });
+
+                fetch.once('end', async () => {
+                    await Promise.all(parsePromises);
+
+                    imap.end();
+
+                    const missingUIDs = uids.filter((uid) => !foundUIDs.has(uid));
+                    if (missingUIDs.length > 0) {
+                        reject(new Error(
+                            `UIDs not found: ${missingUIDs.join(', ')}. ` +
+                            `Found ${results.length} of ${uids.length} requested emails. ` +
+                            `Missing UIDs may have been deleted or moved to another folder.`
+                        ));
+                        return;
+                    }
+
+                    results.sort((a, b) => a.uid - b.uid);
+
+                    const content = [];
+                    let totalAttachments = 0;
+                    let totalSkipped = 0;
+
+                    for (const email of results) {
+                        if (email.attachments.length === 0) {
+                            content.push({
+                                type: 'text',
+                                text: `📧 UID ${email.uid} ("${email.subject}"): no matching attachments found.`
+                            });
+                            continue;
+                        }
+
+                        content.push({
+                            type: 'text',
+                            text: `📧 UID ${email.uid} ("${email.subject}"): ${email.attachments.length} attachment(s) found.`
+                        });
+
+                        for (const att of email.attachments) {
+                            if (att.size > MAX_ATTACHMENT_BYTES) {
+                                totalSkipped++;
+                                content.push({
+                                    type: 'text',
+                                    text: `  ⚠️ Skipped "${att.filename}" (${att.size} bytes) — exceeds ${MAX_ATTACHMENT_BYTES} byte limit.`
+                                });
+                                continue;
+                            }
+
+                            totalAttachments++;
+                            content.push({
+                                type: 'resource',
+                                resource: {
+                                    uri: `attachment://${email.uid}/${encodeURIComponent(att.filename)}`,
+                                    mimeType: att.contentType,
+                                    blob: att.content.toString('base64')
+                                }
+                            });
+                            content.push({
+                                type: 'text',
+                                text: `  - ${att.filename} (${att.contentType}, ${att.size} bytes)`
+                            });
+                        }
+                    }
+
+                    if (totalAttachments === 0 && totalSkipped === 0) {
+                        content.push({
+                            type: 'text',
+                            text: filenameContains
+                                ? `No attachments matching "${filenameContains}" were found in the requested email(s).`
+                                : 'No attachments found in the requested email(s).'
+                        });
+                    }
+
+                    resolve({ content });
                 });
             });
         });
